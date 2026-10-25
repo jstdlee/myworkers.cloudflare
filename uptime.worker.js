@@ -1082,10 +1082,10 @@ async function probe(target) {
   let rootBehavior = "HTTP " + status;
   let protectedProbe = null;
 
-  if (status === 503 && /service disabled|disabled|shut down|maintenance/i.test(low)) {
+  if ((status === 503 && /service disabled|disabled|shut down|maintenance/i.test(low)) || status === 530) {
     exposure = "disabled";
-    hint = "Service disabled (HTTP 503 stub)";
-    rootBehavior = "503 Disabled stub";
+    hint = status === 530 ? "Origin DNS / Route inactive (HTTP 530)" : "Service disabled (HTTP 503 stub)";
+    rootBehavior = status === 530 ? "530 Inactive route" : "503 Disabled stub";
   } else if (status >= 300 && status < 400) {
     if (/cloudflareaccess\.com/i.test(location)) {
       exposure = "access";
