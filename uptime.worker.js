@@ -425,14 +425,20 @@ async function authorize(request, env) {
   if (env.GUARD_SECRET && guardHdr && await safeEqual(guardHdr, env.GUARD_SECRET)) return null;
   const header = request.headers.get("Authorization") || "";
   if (header.startsWith("Basic ")) {
-    let pass = "";
+    let user = "", pass = "";
     try {
       const decoded = atob(header.slice(6));
-      pass = decoded.slice(decoded.indexOf(":") + 1);
+      const idx = decoded.indexOf(":");
+      if (idx !== -1) {
+        user = decoded.slice(0, idx);
+        pass = decoded.slice(idx + 1);
+      }
     } catch {
     }
-    if (env.DASH_PASSWORD && await safeEqual(pass, env.DASH_PASSWORD)) return null;
-    if (env.GUARD_SECRET && await safeEqual(pass, env.GUARD_SECRET)) return null;
+    const wantUser = env.DASH_USER || "admin";
+    const userOk = await safeEqual(user, wantUser);
+    const passOk = env.DASH_PASSWORD ? await safeEqual(pass, env.DASH_PASSWORD) : false;
+    if (userOk && passOk) return null;
   }
   return new Response("Authentication required", {
     status: 401,
