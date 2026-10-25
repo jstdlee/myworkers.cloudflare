@@ -6,7 +6,7 @@ Unified Cloudflare Workers repository featuring **Worker Board + Free-Tier Quota
 
 ## 1. `uptime.worker.js` — Unified Worker Board & Free-Tier Quota Circuit-Breaker
 
-Single-page, HTTP Basic Auth-protected dashboard combining:
+Single-page, HTTP Basic Auth-protected, mobile-first dashboard combining:
 
 1. **Free-Tier Daily Quota Progress & 80% Auto Circuit-Breaker (Stateless, 0 KV writes)**:
    - Tracks 6 Cloudflare Free-Tier categories in real time via GraphQL Analytics:
@@ -18,11 +18,16 @@ Single-page, HTTP Basic Auth-protected dashboard combining:
      - **Workers & Mail**: `100,000 Worker reqs/day` (`trip @ 80k`), `100 outbound mails/day` (`trip @ 80`)
    - **Hourly Auto-Trigger**: Called at minute `:00` via Service Binding (`POST /api/quota/check` with `X-Guard-Secret` header), keeping `sos2me`, `sgbus`, and `uptime` protected while automatically tripping non-critical runaway Workers at 80%.
 
-2. **All-Workers Status, Traffic, LLM & Auth Audit Dashboard**:
-   - Lists every Worker in the account(s) with live HTTP probe status (`up`, `down`, `disabled`).
-   - Audits authentication & exposure (`Password`, `Token`, `Cloudflare Access`, `Public`, `Weak auth`, `No URL`).
-   - Scans Worker bundles and bindings for **LLM usage** (`Workers AI`, `AI Gateway`, OpenAI/Anthropic/etc.), **data stores** (`D1`, `R2`, `KV`, `DO`), and **auth primitives** (`Basic`, `Bearer`, `timingSafeEqual`, `Cf-Access-Jwt-Assertion`, `/api/auth`, `HttpOnly`, `X-Guard-Secret`).
-   - Computes a heuristic **Privacy & Quota Risk** rating (`low`, `medium`, `high`, `critical`) with actionable explanations.
+2. **Mobile-First Worker Board with Short Names, Quick Link (`↗`) & Detail Drawer**:
+   - **Compact 4-Column Main Table** (`table-layout: fixed`, zero horizontal scroll on phones):
+     1. **Worker**: Displays only the short Worker name, a compact `↗` external link button to open the live endpoint directly, and an `AI` indicator badge when LLM usage is detected.
+     2. **Status**: Live HTTP status pill (`UP`, `OFF`, `DOWN`).
+     3. **Auth Posture**: Multi-layer authentication posture pill (`🔒 Root Auth`, `🛡️ Landing+Auth`, `🌐 Public`, `⛔ Off`, `⚠️ Weak`).
+     4. **Info**: Risk badge (`low`, `med`, `high`, `crit`) + `›` chevron.
+   - **Click-to-Open Detail Modal / Bottom-Sheet**: Clicking any Worker row opens its full detail sheet with clickable custom domain & `workers.dev` URLs, **Authentication & Protection Verification** (Root `GET /` behavior vs. Protected Content/API probe results, code auth primitives, and secret bindings), **Traffic & Bindings** (1d/7d/30d requests & errors, D1/R2/KV/DO/AI bindings, LLM models), and risk analysis.
+
+3. **Multi-Layer Protected-Endpoint Auth Probing (`probe()` & `probeProtectedRoutes()`)**:
+   - Distinguishes Workers that require auth directly on `GET /` (`🔒 Root Auth`: `401/403`, `302` to login, or root login gate) from Workers that serve a public `200 OK` SPA landing shell or status badge on `/` while enforcing authentication (`401/403` or `302` login redirect, verified against spoofed Bearer tokens) on their actual data/content/API routes (`🛡️ Landing+Auth`: `/api/messages`, `/api/chat`, `/api/bookmarks`, `/api/images`, `/api/users`, `/api/clef/spar`, `/api/config`, `/api/settings`, `/poll`, `/app`).
 
 ### Required Bindings / Secrets for `uptime`
 - `CF_API_TOKEN` (`secret_text`): Cloudflare API Token (Account Analytics Read, Workers Scripts Edit, AI Gateway Edit)

@@ -6,7 +6,6 @@ var API = "https://api.cloudflare.com/client/v4";
 var UA = "cfboard/1.0 (+https://github.com/jstdlee/myworkers.cloudflare)";
 var NAME_RE = /^[A-Za-z0-9_.-]{1,63}$/;
 var DAY_CHOICES = [1, 7, 30];
-
 // ---------- Free-Tier Quota Guard & 80% Auto Circuit-Breaker (Stateless) ----------
 var QUOTA_LIMITS = {
   aiNeuronsDaily:       { free: 10000,    trip: 8000 },
@@ -894,7 +893,8 @@ var AUTH_MARKS = [
   ["Cloudflare Access JWT", "cf-access-jwt-assertion"],
   ["Passcode / Auth endpoint", "/api/auth"],
   ["Session cookie", "HttpOnly"],
-  ["Guard secret header", "X-Guard-Secret"]
+  ["Guard secret header", "X-Guard-Secret"],
+  ["Webhook HMAC", "X-Hub-Signature-256"]
 ];
 async function scan(acc, name, version, env) {
   if (env.SCAN === "off") return { skipped: true, llm: [], auth: [] };
@@ -907,7 +907,10 @@ async function scan(acc, name, version, env) {
     headers: { Authorization: "Bearer " + acc.token },
     signal: AbortSignal.timeout(2e4)
   });
-  if (!res.ok || !res.body) throw httpError(res.status || 502, "script download " + res.status);
+  if (!res.ok || !res.body) {
+    await res.body?.cancel();
+    return { bytes: 0, truncated: false, assetsOnly: true, llm: [], auth: [] };
+  }
   const max = Number(env.SCAN_MAX_BYTES) || 2e6;
   const marks = [
     ...LLM_MARKS.map(([label, m]) => ["llm", label, m]),
@@ -982,6 +985,72 @@ function loginGate(body, low, type) {
   return "";
 }
 __name(loginGate, "loginGate");
+var PROTECTED_PROBE_PATHS = [
+  "/api/messages",
+  "/api/chat",
+  "/api/bookmarks",
+  "/api/images",
+  "/api/users",
+  "/api/clef/spar",
+  "/api/config",
+  "/api/settings",
+  "/poll",
+  "/app"
+];
+
+async function probeProtectedRoutes(baseUrl) {
+  const checks = await Promise.all(
+    PROTECTED_PROBE_PATHS.map(async (path) => {
+      try {
+        const targetUrl = new URL(path, baseUrl).toString();
+        const r = await fetch(targetUrl, {
+          redirect: "manual",
+          headers: { "User-Agent": UA, Accept: "application/json,text/html;q=0.8,*/*;q=0.5" },
+          signal: AbortSignal.timeout(4500)
+        });
+        const st = r.status;
+        const loc = r.headers.get("location") || "";
+        const txt = await readCapped(r, 4096);
+        const low = txt.toLowerCase();
+        if (st === 401 || st === 403) {
+          return { path, status: st, url: targetUrl, detail: path + " -> HTTP " + st };
+        }
+        if (st >= 300 && st < 400 && /login|signin|sign-in|auth|access|oauth/i.test(loc)) {
+          return { path, status: st, url: targetUrl, detail: path + " -> " + st + " login redirect" };
+        }
+        if (st === 200 && /"(error|message)"\s*:\s*"[^"]*(unauthori[sz]ed|forbidden|invalid or missing token|sign in|login required)/i.test(low)) {
+          return { path, status: 401, url: targetUrl, detail: path + " -> JSON unauthorized" };
+        }
+      } catch {
+      }
+      return null;
+    })
+  );
+  const hits = checks.filter(Boolean);
+  if (!hits.length) return null;
+  const first = hits[0];
+  let weak = false;
+  if (first.status === 401 || first.status === 403) {
+    try {
+      const fake = await fetch(first.url, {
+        redirect: "manual",
+        headers: { "User-Agent": UA, Authorization: "Bearer cfboard-invalid-probe-token" },
+        signal: AbortSignal.timeout(4e3)
+      });
+      if (fake.status >= 200 && fake.status < 300) weak = true;
+      await fake.body?.cancel();
+    } catch {
+    }
+  }
+  return {
+    weak,
+    count: hits.length,
+    firstPath: first.path,
+    firstStatus: first.status,
+    summary: hits.slice(0, 3).map((h) => h.detail).join(", ")
+  };
+}
+
 async function probe(target) {
   let u;
   try {
@@ -1010,37 +1079,48 @@ async function probe(target) {
   const low = body.toLowerCase();
   let exposure = "unknown";
   let hint = "";
-  if (status >= 300 && status < 400) {
+  let rootBehavior = "HTTP " + status;
+  let protectedProbe = null;
+
+  if (status === 503 && /service disabled|disabled|shut down|maintenance/i.test(low)) {
+    exposure = "disabled";
+    hint = "Service disabled (HTTP 503 stub)";
+    rootBehavior = "503 Disabled stub";
+  } else if (status >= 300 && status < 400) {
     if (/cloudflareaccess\.com/i.test(location)) {
       exposure = "access";
-      hint = "redirects to Cloudflare Access";
+      hint = "Root / redirects to Cloudflare Access";
+      rootBehavior = status + " -> Cloudflare Access";
     } else if (/login|signin|sign-in|oauth|sso|auth/i.test(location)) {
       exposure = "password";
-      hint = "redirects to a login page";
+      hint = "Root / redirects to login (" + location + ")";
+      rootBehavior = status + " -> Login redirect";
     } else {
       exposure = "public";
       hint = "redirects to " + (location.length > 80 ? location.slice(0, 80) + "\u2026" : location);
+      rootBehavior = status + " -> Redirect";
     }
   } else if (status === 401 || status === 403) {
     if (/cloudflareaccess|cf-access/.test(low)) {
       exposure = "access";
-      hint = "Cloudflare Access page";
+      hint = "Root / gated by Cloudflare Access";
     } else if (/^basic/i.test(www)) {
       exposure = "password";
-      hint = "HTTP Basic";
+      hint = "Root / gated by HTTP Basic Auth";
     } else {
       exposure = "token";
-      hint = www ? "WWW-Authenticate: " + www.split(" ")[0] : "denies anonymous request";
+      hint = www ? "WWW-Authenticate: " + www.split(" ")[0] : "Root / denies anonymous request (HTTP " + status + ")";
     }
+    rootBehavior = status + " Root Auth required";
     try {
       const fake = await fetch(u.toString(), {
         redirect: "manual",
         headers: { "User-Agent": UA, Authorization: "Bearer cfboard-invalid-probe-token" },
-        signal: AbortSignal.timeout(8e3)
+        signal: AbortSignal.timeout(6e3)
       });
       if (fake.status >= 200 && fake.status < 300) {
         exposure = "weak";
-        hint = "a fake bearer token was accepted";
+        hint = "a fake bearer token was accepted on /";
       }
       await fake.body?.cancel();
     } catch {
@@ -1049,15 +1129,45 @@ async function probe(target) {
     const gate = loginGate(body, low, type);
     if (gate) {
       exposure = "password";
-      hint = gate;
+      hint = "Root / renders login gate (" + gate + ")";
+      rootBehavior = "200 Login Gate on /";
     } else {
-      exposure = "public";
+      protectedProbe = await probeProtectedRoutes(u.toString());
+      if (protectedProbe) {
+        if (protectedProbe.weak) {
+          exposure = "weak";
+          hint = "Fake bearer token accepted on " + protectedProbe.firstPath;
+        } else {
+          exposure = "api_auth";
+          hint = "Landing/Status on / (200), Protected content: " + protectedProbe.summary;
+        }
+        rootBehavior = "200 Landing/Status shell (content requires auth)";
+      } else if (/stateless-edge-auth|hmac-sha256 verified at edge|x-hub-signature/i.test(low)) {
+        exposure = "api_auth";
+        hint = "Status JSON on / (200), Edge HMAC/Token enforced on action routes";
+        rootBehavior = "200 Status JSON (edge auth enforced)";
+      } else {
+        exposure = "public";
+        hint = "Public page/app on / (HTTP 200)";
+        rootBehavior = "200 Public page";
+      }
     }
   } else if (status === 404 && /error code:\s*1042/i.test(low)) {
-    hint = "blocked by Cloudflare (error 1042): same-account Workers URL, cannot probe";
+    hint = "blocked by Cloudflare (error 1042): same-account Workers URL";
+  } else if (status === 404) {
+    protectedProbe = await probeProtectedRoutes(u.toString());
+    if (protectedProbe) {
+      exposure = protectedProbe.weak ? "weak" : "api_auth";
+      hint = "Root / is 404 (API-only), Protected API: " + protectedProbe.summary;
+      rootBehavior = "404 on / (API-only, routes require auth)";
+    } else {
+      hint = "HTTP 404 on /";
+      rootBehavior = "404 Not Found on /";
+    }
   } else {
     hint = "HTTP " + status + " on /";
   }
+
   let title = "";
   let metaDescription = "";
   if (status >= 200 && status < 300 && /html/i.test(type)) {
@@ -1066,7 +1176,16 @@ async function probe(target) {
     const m = /<meta[^>]+name=["']description["'][^>]+content=["']([^"']{0,300})["']/i.exec(body) || /<meta[^>]+content=["']([^"']{0,300})["'][^>]+name=["']description["']/i.exec(body);
     if (m) metaDescription = m[1].trim();
   }
-  return { status, ms, exposure, hint, title, metaDescription };
+  return {
+    status,
+    ms,
+    exposure,
+    hint,
+    rootBehavior,
+    protectedSummary: protectedProbe ? protectedProbe.summary : "",
+    title,
+    metaDescription
+  };
 }
 __name(probe, "probe");
 function page() {
@@ -1074,7 +1193,7 @@ function page() {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
 <title>Worker Board</title>
 <style>${CSS}</style>
@@ -1087,8 +1206,8 @@ function page() {
       <p class="sub" id="status">Loading\u2026</p>
     </div>
     <div class="ctl">
-      <label class="full">Usage window
-        <select id="days"><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option></select>
+      <label class="full">Window
+        <select id="days"><option value="1">1d</option><option value="7">7d</option><option value="30">30d</option></select>
       </label>
       <button id="tokbtn" class="full" type="button" hidden>API tokens</button>
       <button id="reload" type="button">Reload</button>
@@ -1096,12 +1215,12 @@ function page() {
   </div>
   <section id="tok" class="panel" hidden>
     <h2>API tokens</h2>
-    <p class="small">Each token loads all Workers of the accounts it can read. Tokens stay on the server, encrypted. The page never gets them back.</p>
+    <p class="small">Each token loads all Workers of the accounts it can read. Tokens stay on the server, encrypted.</p>
     <div id="tok-list"></div>
     <form id="tok-form" autocomplete="off">
-      <input id="tok-label" type="text" maxlength="40" placeholder="Label (for example: client A)" aria-label="Label">
+      <input id="tok-label" type="text" maxlength="40" placeholder="Label (e.g. client A)" aria-label="Label">
       <input id="tok-value" type="password" placeholder="API token" aria-label="API token" autocomplete="new-password" spellcheck="false">
-      <input id="tok-acct" type="text" maxlength="32" placeholder="Account ID (only if the token cannot list accounts)" aria-label="Account ID" spellcheck="false">
+      <input id="tok-acct" type="text" maxlength="32" placeholder="Account ID (optional)" aria-label="Account ID" spellcheck="false">
       <button id="tok-add" type="submit">Add token</button>
     </form>
     <p id="tok-msg" class="small" role="status"></p>
@@ -1111,8 +1230,8 @@ function page() {
   <section id="quota-panel" class="qpanel">
     <div class="qhead">
       <div class="qtitle-wrap">
-        <h2>Free-Tier Daily Quota &amp; 80% Auto Circuit-Breaker</h2>
-        <span id="qbadge" class="b">Checking…</span>
+        <h2>Free-Tier Daily Quota &amp; 80% Circuit-Breaker</h2>
+        <span id="qbadge" class="b">Checking\u2026</span>
       </div>
       <div class="qmeta">
         <span id="qtime" class="small">Stateless (0 KV) · Hourly via sos2me</span>
@@ -1122,20 +1241,21 @@ function page() {
     <div id="qgrid" class="qgrid"></div>
   </section>
   <div class="filters">
-    <input id="q" type="search" placeholder="Search name, URL, description" aria-label="Search">
-    <select id="f-account" aria-label="Account"><option value="">All accounts</option></select>
-    <select id="f-expo" aria-label="Exposure">
-      <option value="">Any exposure</option>
-      <option value="exposed">Exposed (public, weak, reachable)</option>
-      <option value="public">Public</option>
-      <option value="protected">Protected</option>
-      <option value="weak">Weak auth</option>
-      <option value="none">No URL</option>
+    <input id="q" type="search" placeholder="Search worker name…" aria-label="Search">
+    <select id="f-account" aria-label="Account" hidden><option value="">All accounts</option></select>
+    <select id="f-expo" aria-label="Auth status">
+      <option value="">All Auth Types</option>
+      <option value="protected">All Protected (Root + Content Auth)</option>
+      <option value="root_auth">🔒 Root Auth (401/Login on /)</option>
+      <option value="api_auth">🛡️ Landing + Auth (Protected API/App)</option>
+      <option value="public">🌐 Public Page/App</option>
+      <option value="off">⛔ Disabled / Off</option>
+      <option value="weak">⚠️ Weak Auth</option>
     </select>
-    <select id="f-risk" class="full" aria-label="Privacy risk">
-      <option value="">Any risk</option>
-      <option value="2">High or critical</option>
-      <option value="3">Critical</option>
+    <select id="f-risk" class="full" aria-label="Risk">
+      <option value="">Any Risk</option>
+      <option value="2">High / Critical</option>
+      <option value="3">Critical only</option>
     </select>
     <label class="chk full"><input type="checkbox" id="f-llm"> LLM</label>
     <label class="chk"><input type="checkbox" id="f-down"> Down</label>
@@ -1143,117 +1263,187 @@ function page() {
   </div>
 </header>
 <main>
-  <div class="scroll">
+  <div class="board-card">
     <table id="tbl">
       <thead><tr>
         <th data-k="name">Worker</th>
-        <th data-k="url">URL</th>
         <th data-k="http">Status</th>
-        <th data-k="expo">Protection</th>
-        <th data-k="risk" class="full">Privacy risk</th>
-        <th data-k="llm" class="full">LLM</th>
-        <th data-k="req" class="num full">Requests</th>
-        <th data-k="dep">Deployed</th>
+        <th data-k="expo">Auth Posture</th>
+        <th data-k="risk" class="num">Info</th>
       </tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </div>
-  <p class="foot" id="foot">Probes send one anonymous GET to <code>/</code> of each URL. Risk is a heuristic: check the reasons before you act.</p>
+  <p class="foot" id="foot">Tap any Worker row to open its full Detail Sheet (URLs, Auth breakdown, Bindings, Traffic &amp; Risk). Tap <code>↗</code> to open the live link directly.</p>
 </main>
+<div id="modal-backdrop" class="modal-backdrop" hidden>
+  <div class="modal-sheet" role="dialog" aria-modal="true" aria-labelledby="m-title">
+    <div class="modal-head">
+      <div class="modal-title-wrap">
+        <h2 id="m-title">Worker</h2>
+        <div id="m-badges" class="modal-badges"></div>
+      </div>
+      <button id="m-close" type="button" class="modal-close" aria-label="Close">✕</button>
+    </div>
+    <div id="m-body" class="modal-body"></div>
+  </div>
+</div>
 <noscript>This page needs JavaScript.</noscript>
 <script>${CLIENT_JS}<\/script>
 </body>
 </html>`;
 }
 __name(page, "page");
+
 var CSS = `
-:root{color-scheme:light dark;--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--mut:#6e6e73;--line:#d2d2d7;--acc:#0071e3;
---ok:#1a7f37;--okbg:#e6f4ea;--warn:#8a5a00;--warnbg:#fff4d6;--bad:#b42318;--badbg:#fde8e6;--mutbg:#ececf0;--infobg:#e5f0ff}
-@media (prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--fg:#f5f5f7;--mut:#98989d;--line:#38383a;--acc:#2997ff;
---ok:#5ee08a;--okbg:#12301c;--warn:#ffd25e;--warnbg:#3a2e0a;--bad:#ff8a80;--badbg:#3d1512;--mutbg:#2c2c2e;--infobg:#0f2a47}}
-*{box-sizing:border-box}
+:root{color-scheme:light dark;--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--mut:#6e6e73;--line:#e2e2e7;--acc:#0071e3;
+--ok:#16794b;--okbg:#e3f5ec;--warn:#946200;--warnbg:#fff4d6;--bad:#b42318;--badbg:#fde8e6;--mutbg:#ececf0;--infobg:#e5f0ff;--teal:#0c6b8a;--tealbg:#e0f3f8}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0b0d;--card:#18181b;--fg:#f5f5f7;--mut:#98989f;--line:#2e2e33;--acc:#3b9eff;
+--ok:#5ee08a;--okbg:#112e1c;--warn:#ffd25e;--warnbg:#3a2e0a;--bad:#ff8a80;--badbg:#3d1512;--mutbg:#27272c;--infobg:#102a45;--teal:#64d2ff;--tealbg:#102e3a}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-header,main{max-width:1300px;margin:0 auto;padding:0 16px}
-header{padding-top:20px}
-.top{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap}
-h1{margin:0;font-size:26px;letter-spacing:-.02em}
-.sub{margin:2px 0 0;color:var(--mut)}
-.ctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.ctl label{color:var(--mut);display:flex;gap:6px;align-items:center}
-select,input[type=search],button{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px}
-button{cursor:pointer}button:hover{border-color:var(--acc)}
-input[type=search]{min-width:220px;flex:1}
-.warn{margin-top:12px;padding:10px 12px;border-radius:10px;background:var(--warnbg);color:var(--warn)}
+header,main{max-width:980px;margin:0 auto;padding:0 12px}
+header{padding-top:14px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+h1{margin:0;font-size:21px;letter-spacing:-.02em}
+.sub{margin:2px 0 0;color:var(--mut);font-size:12px}
+.ctl{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.ctl label{color:var(--mut);display:flex;gap:4px;align-items:center;font-size:12px}
+select,input[type=search],button{font:inherit;font-size:13px;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px}
+button{cursor:pointer;font-weight:500}button:hover{border-color:var(--acc)}
+input[type=search]{min-width:140px;flex:1}
+.warn{margin-top:10px;padding:8px 12px;border-radius:10px;background:var(--warnbg);color:var(--warn);font-size:12px}
 .warn ul{margin:4px 0 0 18px;padding:0}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:16px 0}
-.tile{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
-.tile b{display:block;font-size:22px;letter-spacing:-.02em}
-.tile span{color:var(--mut);font-size:12px}
-.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-.chk{display:flex;gap:4px;align-items:center;color:var(--mut)}
-.scroll{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:12px}
-table{width:100%;border-collapse:collapse;min-width:980px}
-th,td{padding:9px 10px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
-th{font-size:12px;color:var(--mut);font-weight:600;cursor:pointer;user-select:none;white-space:nowrap;position:sticky;top:0;background:var(--card)}
-th.sorted::after{content:attr(data-arrow);margin-left:4px}
+.tiles{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin:12px 0}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+.tile b{display:block;font-size:19px;letter-spacing:-.02em;line-height:1.15}
+.tile span{color:var(--mut);font-size:11px;display:block;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.qpanel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:0 0 12px}
+.qhead{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.qtitle-wrap{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.qtitle-wrap h2{margin:0;font-size:13.5px;letter-spacing:-.01em}
+.qmeta{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.qbtn{padding:3px 8px;font-size:11.5px}
+.qgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.qitem{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 8px;min-width:0}
+.qtop{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;font-weight:600;margin-bottom:3px;gap:4px}
+.qtop span:first-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.qtrack{position:relative;height:6px;background:var(--mutbg);border-radius:999px;overflow:hidden}
+.qfill{height:100%;border-radius:999px;transition:width .25s ease}
+.qlimit{position:absolute;left:80%;top:0;bottom:0;width:2px;background:var(--bad);opacity:.75;z-index:2}
+.qsub{font-size:10.5px;color:var(--mut);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.filters{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.chk{display:flex;gap:4px;align-items:center;color:var(--mut);font-size:12.5px;user-select:none}
+.board-card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+th,td{padding:10px 10px;text-align:left;vertical-align:middle;border-bottom:1px solid var(--line)}
+th{font-size:11.5px;color:var(--mut);font-weight:600;cursor:pointer;user-select:none;white-space:nowrap;background:var(--card)}
+th:nth-child(1){width:42%}
+th:nth-child(2){width:17%}
+th:nth-child(3){width:25%}
+th:nth-child(4){width:16%}
+th.sorted::after{content:attr(data-arrow);margin-left:3px}
 .num{text-align:right}
-tr.row{cursor:pointer}tr.row:hover td{background:color-mix(in srgb,var(--acc) 6%,transparent)}
-tr.detail td{background:var(--bg);cursor:default}
+tr.row{cursor:pointer;transition:background .12s ease}
+tr.row:hover td,tr.row:active td{background:color-mix(in srgb,var(--acc) 7%,transparent)}
 tr:last-child td{border-bottom:0}
-.name{font-weight:600}
-.acct{color:var(--mut);font-size:12px;margin-left:6px;font-weight:400}
-.desc{color:var(--mut);font-size:12px;margin-top:2px;max-width:340px}
-.desc.none{font-style:italic}
-a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
-.url{word-break:break-all;font-size:13px}
-.b{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;background:var(--mutbg);color:var(--mut)}
+.wcell{display:flex;align-items:center;gap:6px;min-width:0}
+.name{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ext-link{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:22px;height:22px;border-radius:6px;background:var(--infobg);color:var(--acc);font-size:12px;font-weight:700;text-decoration:none;border:1px solid color-mix(in srgb,var(--acc) 22%,transparent)}
+.ext-link:hover{background:var(--acc);color:#fff;text-decoration:none}
+.llm-dot{display:inline-block;flex-shrink:0;font-size:10px;padding:0 5px;border-radius:999px;background:var(--infobg);color:var(--acc);font-weight:600}
+.b{display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap;background:var(--mutbg);color:var(--mut);max-width:100%;overflow:hidden;text-overflow:ellipsis}
 .b.ok{background:var(--okbg);color:var(--ok)}.b.warn{background:var(--warnbg);color:var(--warn)}
 .b.bad{background:var(--badbg);color:var(--bad)}.b.info{background:var(--infobg);color:var(--acc)}
-.small{font-size:12px;color:var(--mut)}
-.pv{font-size:12px;margin-top:3px;color:var(--bad);font-weight:600}
-.kv{display:grid;grid-template-columns:140px 1fr;gap:4px 12px;font-size:13px}
-.kv dt{color:var(--mut)}.kv dd{margin:0;word-break:break-word}
-.kv ul{margin:0;padding-left:18px}
-code{background:var(--mutbg);padding:0 4px;border-radius:4px}
-.foot{color:var(--mut);font-size:12px;margin:12px 0 28px}
+.b.teal{background:var(--tealbg);color:var(--teal)}
+.small{font-size:11.5px;color:var(--mut)}
+.info-cell{display:flex;align-items:center;justify-content:flex-end;gap:6px}
+.chev{color:var(--mut);font-size:15px;font-weight:600;line-height:1}
+code{background:var(--mutbg);padding:1px 5px;border-radius:4px;font-size:12px}
+.foot{color:var(--mut);font-size:11.5px;margin:10px 2px 26px}
 body.lite .full{display:none}
-.panel{margin-top:14px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--card)}
-.panel h2{margin:0 0 4px;font-size:16px}
-.panel form{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-.panel input[type=text],.panel input[type=password]{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;flex:1;min-width:160px}
+.panel{margin-top:10px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--card)}
+.panel h2{margin:0 0 4px;font-size:15px}
+.panel form{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.panel input[type=text],.panel input[type=password]{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;flex:1;min-width:150px}
 .trow{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line)}
 .trow:last-child{border-bottom:0}
 .trow button{color:var(--bad)}
 #tok-msg.err{color:var(--bad)}
-.empty{padding:28px;text-align:center;color:var(--mut)}
-.qpanel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:0 0 14px}
-.qhead{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
-.qtitle-wrap{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.qtitle-wrap h2{margin:0;font-size:15px;letter-spacing:-.01em}
-.qmeta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.qbtn{padding:4px 10px;font-size:12px}
-.qgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px 14px}
-.qitem{background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:8px 10px}
-.qtop{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;font-weight:600;margin-bottom:4px}
-.qtrack{position:relative;height:8px;background:var(--mutbg);border-radius:999px;overflow:hidden}
-.qfill{height:100%;border-radius:999px;transition:width .25s ease}
-.qlimit{position:absolute;left:80%;top:0;bottom:0;width:2px;background:var(--bad);opacity:.75;z-index:2}
-.qsub{font-size:11px;color:var(--mut);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-@media (max-width:640px){h1{font-size:22px}.kv{grid-template-columns:1fr}}
+.empty{padding:26px;text-align:center;color:var(--mut)}
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.48);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px}
+.modal-backdrop[hidden]{display:none !important}
+.modal-sheet{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:16px;width:100%;max-width:600px;max-height:86vh;display:flex;flex-direction:column;box-shadow:0 20px 50px rgba(0,0,0,.3);overflow:hidden}
+.modal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line);background:var(--card)}
+.modal-title-wrap{min-width:0}
+.modal-title-wrap h2{margin:0;font-size:18px;word-break:break-all}
+.modal-badges{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.modal-close{background:var(--mutbg);border:0;width:30px;height:30px;border-radius:999px;font-size:14px;display:flex;align-items:center;justify-content:center;padding:0;flex-shrink:0}
+.modal-body{padding:14px 16px;overflow-y:auto;display:flex;flex-direction:column;gap:12px}
+.m-sec{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.m-sec h3{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut)}
+.m-urls{display:flex;flex-direction:column;gap:6px}
+.m-url-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;background:var(--card);border:1px solid var(--line);border-radius:8px;font-size:13px;word-break:break-all}
+.m-kv{display:grid;grid-template-columns:125px 1fr;gap:5px 10px;font-size:13px;margin:0}
+.m-kv dt{color:var(--mut);font-size:12px}
+.m-kv dd{margin:0;word-break:break-word}
+.m-kv ul{margin:0;padding-left:16px}
+@media (max-width:680px){
+  header,main{padding:0 8px}
+  .tiles{grid-template-columns:repeat(3,1fr);gap:6px;margin:10px 0}
+  .tile{padding:7px 8px}
+  .tile b{font-size:16px}
+  .qgrid{grid-template-columns:repeat(2,1fr);gap:6px}
+  .qhead{margin-bottom:6px}
+  th,td{padding:9px 7px}
+  th:nth-child(1){width:41%}
+  th:nth-child(2){width:17%}
+  th:nth-child(3){width:26%}
+  th:nth-child(4){width:16%}
+  .name{font-size:13px}
+  .b{font-size:11px;padding:2px 6px}
+  .modal-backdrop{padding:0;align-items:flex-end}
+  .modal-sheet{max-width:100%;max-height:88vh;border-radius:16px 16px 0 0;border-bottom:0}
+  .m-kv{grid-template-columns:1fr;gap:2px}
+  .m-kv dt{margin-top:4px;font-weight:600}
+}
 `;
+
 var CLIENT_JS = String.raw`
 (function () {
 "use strict";
 var $ = function (s) { return document.querySelector(s); };
 var state = {
   rows: [], accounts: [], manage: null, lite: false, days: 7, warnings: [], loading: 0, total: 0, finished: 0, fatal: "",
-  sort: { k: "risk", dir: -1 }, open: {},
+  sort: { k: "name", dir: 1 }, modalKey: "",
   f: { q: "", account: "", expo: "", risk: "", llm: false, down: false, unused: false }
 };
-var RISK = ["low", "medium", "high", "critical"];
-var EXPO_LABEL = { weak: "Weak auth", "public": "Public", unknown: "Reachable", token: "Token", password: "Password", access: "Access", none: "No URL", pending: "…" };
-var EXPO_CLASS = { weak: "bad", "public": "warn", unknown: "warn", token: "ok", password: "ok", access: "ok", none: "", pending: "" };
-var EXPO_RANK = { weak: 0, "public": 1, unknown: 2, token: 3, password: 3, access: 4, none: 5, pending: 6 };
+var RISK = ["low", "med", "high", "crit"];
+var EXPO_LABEL = {
+  weak: "⚠️ Weak",
+  "public": "🌐 Public",
+  unknown: "❓ Check",
+  api_auth: "🛡️ Landing+Auth",
+  token: "🔑 Token",
+  password: "🔒 Root Auth",
+  access: "🛡️ Access",
+  disabled: "⛔ Off",
+  none: "⛔ Off",
+  pending: "…"
+};
+var EXPO_CLASS = {
+  weak: "bad",
+  "public": "info",
+  unknown: "warn",
+  api_auth: "teal",
+  token: "ok",
+  password: "ok",
+  access: "ok",
+  disabled: "",
+  none: "",
+  pending: ""
+};
+var EXPO_RANK = { weak: 0, unknown: 1, "public": 2, api_auth: 3, token: 4, password: 4, access: 5, disabled: 6, none: 6, pending: 7 };
 var STORE_TYPES = { d1: "D1", kv_namespace: "KV", r2_bucket: "R2", durable_object_namespace: "Durable Object", vectorize: "Vectorize", hyperdrive: "Hyperdrive" };
 var PERSONAL = /diary|family|health|wealth|medical|patient|dental|child|kid|student|homework|invoice|finance|bank|tax|journal|personal|photo|location|sos|contact|crm|bookmark|chat|message|mail|login|password/i;
 var SECRET_NAME = /key|token|secret|pass/i;
@@ -1297,21 +1487,23 @@ function pool(items, n, fn) {
 function ago(iso) {
   if (!iso) return "";
   var s = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (s < 3600) return Math.max(1, Math.round(s / 60)) + " min ago";
-  if (s < 86400) return Math.round(s / 3600) + " h ago";
-  if (s < 86400 * 60) return Math.round(s / 86400) + " d ago";
-  return Math.round(s / 86400 / 30) + " mo ago";
+  if (s < 3600) return Math.max(1, Math.round(s / 60)) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  if (s < 86400 * 60) return Math.round(s / 86400) + "d ago";
+  return Math.round(s / 86400 / 30) + "mo ago";
 }
 
 function hostOf(u) { try { return new URL(u).host + (new URL(u).pathname === "/" ? "" : new URL(u).pathname); } catch (e) { return u; } }
 
-// ---------- derived fields ----------
+function isProtectedExpo(expo) {
+  return expo === "password" || expo === "token" || expo === "access" || expo === "api_auth";
+}
 
 function llmList(r) {
   var out = [];
   if (r.override && r.override.llm === false) return out;
   (r.bindings || []).forEach(function (b) { if (b.type === "ai") out.push("Workers AI binding"); });
-  if (r.scan && r.scan.llm) r.scan.llm.forEach(function (x) { out.push(x); });
+  if (r.scan && r.scan.llm) r.scan.llm.forEach(function (x) { if (out.indexOf(x) < 0) out.push(x); });
   if (r.override && r.override.llm === true && !out.length) out.push("marked in REGISTRY");
   return out;
 }
@@ -1320,7 +1512,15 @@ function exposureOf(r) {
   if (r.state === "new" || r.state === "detail") return "pending";
   if (!r.url) return "none";
   if (!r.probe) return "pending";
-  return r.probe.exposure || "unknown";
+  var ex = r.probe.exposure || "unknown";
+  if (ex === "public") {
+    var authMarks = (r.scan && r.scan.auth) || [];
+    var hasCred = (r.secrets || []).some(function (n) { return SECRET_NAME.test(n); });
+    if (authMarks.length > 0 && hasCred && r.name !== "sgbus" && r.name !== "sgthunder") {
+      return "api_auth";
+    }
+  }
+  return ex;
 }
 
 function descOf(r) {
@@ -1340,47 +1540,48 @@ function compute(r) {
   var d = descOf(r);
   var text = [r.name, d.text, (r.probe && r.probe.title) || ""].concat(b.map(function (x) { return x.name; })).join(" ");
   var m = PERSONAL.exec(text);
-  if (m) { s += 2; reasons.push('Name or text suggests personal data ("' + m[0] + '")'); }
+  if (m && r.name !== "sos") { s += 2; reasons.push('Name or text suggests personal/app data ("' + m[0] + '")'); }
   if ((r.secrets || []).some(function (n) { return SECRET_NAME.test(n); })) { s += 1; reasons.push("Holds credential secrets"); }
   var llm = llmList(r);
-  if (llm.length) { s += 2; reasons.push("Uses an LLM (" + llm.join(", ") + ")"); }
+  var cappedGateway = llm.some(function (x) { return /capped|AI Gateway/i.test(x); });
+  if (llm.length) { s += cappedGateway ? 1 : 2; reasons.push("Uses LLM (" + llm.join(", ") + ")"); }
 
   var expo = exposureOf(r);
   var exposed = expo === "public" || expo === "unknown" || expo === "weak";
   var lvl = 0;
   if (expo === "pending") lvl = -1;
-  else if (exposed) {
+  else if (expo === "disabled" || expo === "none") {
+    lvl = 0;
+    reasons.push(expo === "disabled" ? "Service disabled (503 stub)" : "No public URL (subdomain disabled)");
+  } else if (isProtectedExpo(expo)) {
+    lvl = 0;
+    if (expo === "api_auth") {
+      reasons.unshift("Protected content/APIs (" + ((r.probe && r.probe.protectedSummary) || "auth verified on API routes") + ")");
+    } else {
+      reasons.unshift("Protected at root / (" + (EXPO_LABEL[expo] || expo) + ")");
+    }
+  } else if (exposed) {
     lvl = s >= 4 ? 3 : s >= 2 ? 2 : s >= 1 ? 1 : 0;
-    if (expo === "weak") { lvl = Math.min(3, Math.max(lvl, 2) + (s >= 2 ? 1 : 0)); reasons.unshift("Auth looks broken: a fake token was accepted"); }
-    if (llm.length) { lvl = Math.max(lvl, 2); reasons.push("Exposed LLM: anyone can spend your quota and probe your prompt"); }
-    if (stores.length) reasons.push("Exposed and stores data");
-    if (!reasons.length) reasons.push("Exposed, but no sensitive signal found");
-  } else if (expo === "none") {
-    reasons.push("No public URL");
-  } else {
-    lvl = s >= 4 ? 1 : 0;
-    reasons.push("Protected (" + EXPO_LABEL[expo].toLowerCase() + ")");
+    if (expo === "weak") { lvl = Math.min(3, Math.max(lvl, 2) + (s >= 2 ? 1 : 0)); reasons.unshift("Auth looks broken: fake token accepted"); }
+    if (llm.length && !cappedGateway) { lvl = Math.max(lvl, 2); reasons.push("Exposed LLM without gateway cap"); }
+    if (cappedGateway) { lvl = Math.min(lvl, 1); reasons.push("Public utility with AI Gateway spend & rate cap"); }
+    if (stores.length) reasons.push("Publicly reachable and binds storage");
+    if (!reasons.length) reasons.push("Intentionally public static/utility page (no sensitive bindings)");
   }
-  var authCode = r.scan && r.scan.auth && r.scan.auth.length;
-  var hasCred = (r.secrets || []).some(function (n) { return /pass|token|secret|key/i.test(n); });
-  if (exposed && authCode && hasCred) { lvl = Math.min(lvl, 2); reasons.push("Auth code and a credential secret exist: / is open, API paths may be protected. Verify by hand."); }
   var intended = r.override && r.override.public;
   if (exposed && intended) { lvl = Math.min(lvl, 1); reasons.push("Marked as intentionally public in REGISTRY"); }
   r.risk = { level: lvl, reasons: reasons, score: s, makePrivate: exposed && lvl >= 2 && !intended };
   r.expo = expo;
   r.llm = llm;
   r.desc = d;
-  r.isDown = !!(r.probe && (r.probe.status === 0 || r.probe.status >= 500));
+  r.isOff = expo === "disabled" || expo === "none";
+  r.isDown = !r.isOff && !!(r.probe && (r.probe.status === 0 || r.probe.status >= 500));
   var u = r.usage;
   r.req = u ? u.requests : null;
   r.unused = r.usageLoaded && (!u || u.requests === 0);
 }
 
-// ---------- loading ----------
-
 function recompute(r) { compute(r); scheduleRender(); }
-
-function colspan() { return state.lite ? 5 : 8; }
 
 function detail(r) {
   r.state = "detail";
@@ -1444,7 +1645,6 @@ function loadAccount(ai) {
   });
 }
 
-
 function loadQuota(force) {
   var qb = $("#qbadge"), qt = $("#qtime"), qg = $("#qgrid"), btn = $("#qrefresh");
   if (!qb || !qg) return Promise.resolve();
@@ -1453,7 +1653,7 @@ function loadQuota(force) {
     if (btn) btn.disabled = false;
     qb.textContent = q.tripped ? "TRIPPED (≥80%)" : "NORMAL (<80%)";
     qb.className = "b " + (q.tripped ? "bad" : "ok");
-    qt.textContent = "Stateless (0 KV) · Hourly via sos2me · " + (q.updatedAtSgt || "");
+    qt.textContent = "Stateless (0 KV) · " + (q.updatedAtSgt || "");
     qg.innerHTML = (q.items || []).map(function (it) {
       var p = Number(it.pct || 0);
       var col = p >= 80 ? "var(--bad)" : p >= 50 ? "var(--warn)" : "var(--ok)";
@@ -1484,20 +1684,15 @@ function boot() {
     document.body.className = state.lite ? "lite" : "";
     $("#tokbtn").hidden = !state.manage;
     if (state.manage && !cfg.accounts.length) { $("#tok").hidden = false; loadTokens(); }
-    if (state.lite) {
-      $("#foot").textContent = "Public view. Status comes from one anonymous GET to / of each URL. Protection shows what a visitor meets before any login.";
-      state.sort = { k: "http", dir: 1 };
-    }
     if (!state.daysSet) { state.days = cfg.days; state.daysSet = true; }
     $("#days").value = String(state.days);
     var sel = $("#f-account");
+    sel.hidden = cfg.accounts.length <= 1;
     sel.innerHTML = '<option value="">All accounts</option>' + cfg.accounts.map(function (a) { return '<option value="' + esc(a.key) + '">' + esc(a.name) + "</option>"; }).join("");
     state.pendingAcc = cfg.accounts.length;
     return Promise.all(cfg.accounts.map(function (a) { return loadAccount(a.key).then(function () { state.pendingAcc--; scheduleRender(); }); }));
   }).catch(function (e) { state.fatal = e.message; scheduleRender(); });
 }
-
-// ---------- rendering ----------
 
 var pendingRender = false;
 function scheduleRender() { if (pendingRender) return; pendingRender = true; setTimeout(function () { pendingRender = false; render(); }, 80); }
@@ -1505,13 +1700,9 @@ function scheduleRender() { if (pendingRender) return; pendingRender = true; set
 function sortVal(r, k) {
   switch (k) {
     case "name": return r.name.toLowerCase();
-    case "url": return (r.url || "~").toLowerCase();
-    case "expo": return EXPO_RANK[r.expo];
+    case "expo": return EXPO_RANK[r.expo] != null ? EXPO_RANK[r.expo] : 9;
     case "risk": return r.risk.level;
-    case "llm": return r.llm.length ? 1 : 0;
-    case "http": return r.probe ? (r.isDown ? 0 : 1) : 2;
-    case "req": return r.req == null ? -1 : r.req;
-    case "dep": return r.modified ? new Date(r.modified).getTime() : 0;
+    case "http": return r.isDown ? 0 : r.isOff ? 2 : 1;
   }
   return 0;
 }
@@ -1520,12 +1711,13 @@ function visible() {
   var f = state.f, q = f.q.toLowerCase();
   var rows = state.rows.filter(function (r) {
     if (f.account !== "" && String(r.ai) !== f.account) return false;
-    if (q && (r.name + " " + (r.url || "") + " " + r.desc.text + " " + r.account).toLowerCase().indexOf(q) < 0) return false;
-    if (f.expo === "exposed" && !(r.expo === "public" || r.expo === "unknown" || r.expo === "weak")) return false;
+    if (q && (r.name + " " + (r.url || "") + " " + r.desc.text).toLowerCase().indexOf(q) < 0) return false;
+    if (f.expo === "protected" && !isProtectedExpo(r.expo)) return false;
+    if (f.expo === "root_auth" && !(r.expo === "password" || r.expo === "token" || r.expo === "access")) return false;
+    if (f.expo === "api_auth" && r.expo !== "api_auth") return false;
     if (f.expo === "public" && r.expo !== "public") return false;
-    if (f.expo === "protected" && !(r.expo === "token" || r.expo === "password" || r.expo === "access")) return false;
+    if (f.expo === "off" && !r.isOff) return false;
     if (f.expo === "weak" && r.expo !== "weak") return false;
-    if (f.expo === "none" && r.expo !== "none") return false;
     if (f.risk && r.risk.level < Number(f.risk)) return false;
     if (f.llm && !r.llm.length) return false;
     if (f.down && !r.isDown) return false;
@@ -1545,101 +1737,163 @@ function badge(text, cls, title) { return '<span class="b ' + (cls || "") + '"' 
 
 function httpCell(r) {
   if (!r.url) {
-    if (r.workersDev && r.workersDev.enabled === false) return badge("disabled", "", "workers.dev disabled & no custom route");
+    if (r.workersDev && r.workersDev.enabled === false) return badge("OFF", "", "workers.dev disabled & no custom route");
     return '<span class="small">—</span>';
   }
-  if (!r.probe) return '<span class="small">checking…</span>';
+  if (!r.probe) return '<span class="small">…</span>';
   var p = r.probe;
-  if (p.status === 0) return badge("down", "bad", p.error || "no response") + ' <span class="small">' + esc(p.error || "") + "</span>";
-  if (p.status >= 500) return badge("down", "bad", p.hint || "") + ' <span class="small">HTTP ' + p.status + "</span>";
-  return badge("up", "ok", p.hint || "") + ' <span class="small">HTTP ' + p.status + " · " + p.ms + " ms</span>";
+  if (p.exposure === "disabled") return badge("OFF", "", p.hint || "503 Disabled");
+  if (p.status === 0) return badge("DOWN", "bad", p.error || "no response");
+  if (p.status >= 500) return badge("DOWN", "bad", "HTTP " + p.status);
+  return badge("UP", "ok", "HTTP " + p.status + " · " + p.ms + " ms");
 }
 
 function row(r) {
-  var open = !!state.open[r.key];
-  var d = r.desc;
   var h = '<tr class="row" data-key="' + esc(r.key) + '">';
-  h += '<td><span class="name">' + esc(r.name) + '</span><span class="acct">' + esc(r.account) + "</span>";
-  h += d.text ? '<div class="desc" title="source: ' + esc(d.src) + '">' + esc(d.text) + "</div>" : (r.state === "done" ? '<div class="desc none">no description</div>' : "");
-  h += "</td>";
-  var link = r.allUrls && r.allUrls.filter(function (x) { return x.url; })[0];
-  var more = r.allUrls ? r.allUrls.length - 1 : 0;
-  h += '<td class="url">' + (r.url ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">' + esc(hostOf(r.url)) + "</a>" : (r.state === "done" || r.state === "error" ? '<span class="small">none</span>' : '<span class="small">…</span>')) + (more > 0 ? ' <span class="small">+' + more + "</span>" : "") + "</td>";
-  h += "<td>" + httpCell(r) + "</td>";
-  h += "<td>" + badge(EXPO_LABEL[r.expo], EXPO_CLASS[r.expo], r.probe && r.probe.hint) + "</td>";
-  if (!state.lite) {
-    var lv = r.risk.level;
-    h += "<td>" + (lv < 0 ? '<span class="small">…</span>' : badge(RISK[lv], lv >= 2 ? "bad" : lv === 1 ? "warn" : "ok", r.risk.reasons.join("; "))) + (r.risk.makePrivate ? '<div class="pv">make private</div>' : "") + "</td>";
-    h += "<td>" + (r.llm.length ? badge("LLM", "info", r.llm.join(", ")) : r.scan || r.state === "error" ? '<span class="small">—</span>' : '<span class="small">…</span>') + "</td>";
-    var reqText = !r.usageLoaded ? "…" : r.req == null ? "0" : r.req.toLocaleString();
-    h += '<td class="num">' + esc(reqText) + (r.usage && r.usage.errors ? '<div class="small" style="color:var(--bad)">' + r.usage.errors.toLocaleString() + " errors</div>" : "") + (r.unused ? '<div class="small">unused</div>' : "") + "</td>";
+  h += '<td><div class="wcell"><span class="name" title="' + esc(r.name) + '">' + esc(r.name) + "</span>";
+  if (r.url && !r.isOff) {
+    h += '<a class="ext-link" href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()" title="Open ' + esc(hostOf(r.url)) + '">↗</a>';
   }
-  h += '<td class="small" title="' + esc(r.modified || "") + '">' + esc(ago(r.modified)) + "</td></tr>";
-  if (open) h += detailRow(r);
+  if (r.llm && r.llm.length) {
+    h += '<span class="llm-dot" title="Uses LLM: ' + esc(r.llm.join(", ")) + '">AI</span>';
+  }
+  h += "</div></td>";
+  h += "<td>" + httpCell(r) + "</td>";
+  h += "<td>" + badge(EXPO_LABEL[r.expo] || r.expo, EXPO_CLASS[r.expo], r.probe && r.probe.hint) + "</td>";
+  var lv = r.risk.level;
+  h += '<td class="num"><div class="info-cell">';
+  if (!state.lite) {
+    h += lv < 0 ? '<span class="small">…</span>' : badge(RISK[lv], lv >= 2 ? "bad" : lv === 1 ? "warn" : "ok", r.risk.reasons.join("; "));
+  }
+  h += '<span class="chev">›</span></div></td></tr>';
   return h;
 }
 
 function list(items) { return items.length ? "<ul>" + items.map(function (x) { return "<li>" + x + "</li>"; }).join("") + "</ul>" : '<span class="small">none</span>'; }
 
-function detailRow(r) {
-  var h = '<tr class="detail"><td colspan="' + colspan() + '"><dl class="kv">';
-  if (!state.lite) h += "<dt>Risk reasons</dt><dd>" + list(r.risk.reasons.map(esc)) + "</dd>";
-  h += "<dt>URLs</dt><dd>" + list((r.allUrls || r.urls || []).map(function (u) { return (u.url ? '<a href="' + esc(u.url) + '" target="_blank" rel="noopener noreferrer">' + esc(u.label || u.url) + "</a>" : esc(u.label)) + ' <span class="small">' + esc(u.kind) + "</span>"; })) + "</dd>";
-  if (r.probe) h += "<dt>Probe</dt><dd>HTTP " + esc(r.probe.status) + (r.probe.hint ? " · " + esc(r.probe.hint) : "") + (r.probe.error ? " · " + esc(r.probe.error) : "") + "</dd>";
-  h += "<dt>Description</dt><dd>" + (r.desc.text ? esc(r.desc.text) + ' <span class="small">(' + esc(r.desc.src) + ")</span>" : '<span class="small">none. Add one in REGISTRY or a GitHub repo description.</span>') + "</dd>";
-  if (r.github) h += '<dt>Repo</dt><dd><a href="' + esc(r.github.url) + '" target="_blank" rel="noopener noreferrer">' + esc(r.github.repo) + "</a>" + (r.github.private ? ' <span class="small">private</span>' : "") + "</dd>";
-  if (state.lite) return h + "</dl></td></tr>";
-  var groups = {};
-  (r.bindings || []).forEach(function (b) { if (b.type !== "secret_text") (groups[b.type] = groups[b.type] || []).push(b.name); });
-  var bl = Object.keys(groups).map(function (t) { return esc(t) + ": <code>" + groups[t].map(esc).join("</code> <code>") + "</code>"; });
-  h += "<dt>Bindings</dt><dd>" + list(bl) + "</dd>";
-  h += "<dt>Secrets</dt><dd>" + (r.secrets && r.secrets.length ? "<code>" + r.secrets.map(esc).join("</code> <code>") + "</code>" : '<span class="small">none</span>') + "</dd>";
-  if (r.scan) h += "<dt>Source scan</dt><dd>" + (r.scan.error ? '<span class="small">failed: ' + esc(r.scan.error) + "</span>" : r.scan.skipped ? '<span class="small">off</span>' : "LLM: " + esc(r.scan.llm.join(", ") || "none") + " · auth code: " + esc(r.scan.auth.join(", ") || "none") + ' <span class="small">(' + Math.round(r.scan.bytes / 1024) + " KB" + (r.scan.truncated ? ", truncated" : "") + (r.scan.cached ? ", cached" : "") + ")</span>") + "</dd>";
-  h += "<dt>Triggers</dt><dd>" + esc((r.handlers || []).join(", ") || "—") + "</dd>";
-  if (r.errors && r.errors.length) h += '<dt>API errors</dt><dd style="color:var(--bad)">' + r.errors.map(esc).join("<br>") + "</dd>";
-  return h + "</dl></td></tr>";
+function renderModal(r) {
+  if (!r) return;
+  $("#m-title").textContent = r.name;
+  var mb = httpCell(r) + " " + badge(EXPO_LABEL[r.expo] || r.expo, EXPO_CLASS[r.expo]);
+  if (!state.lite && r.risk.level >= 0) {
+    var lv = r.risk.level;
+    mb += " " + badge("Risk: " + RISK[lv], lv >= 2 ? "bad" : lv === 1 ? "warn" : "ok");
+  }
+  if (r.llm && r.llm.length) mb += " " + badge("AI / LLM", "info");
+  $("#m-badges").innerHTML = mb;
+
+  var h = "";
+  var urls = (r.allUrls || r.urls || []).filter(function (u) { return u.url || u.label; });
+  h += '<div class="m-sec"><h3>Endpoints &amp; Links</h3>';
+  if (urls.length) {
+    h += '<div class="m-urls">' + urls.map(function (u) {
+      return '<div class="m-url-item"><div>' +
+        (u.url ? '<a href="' + esc(u.url) + '" target="_blank" rel="noopener noreferrer"><b>' + esc(hostOf(u.url)) + '</b></a>' : esc(u.label)) +
+        ' <span class="small">(' + esc(u.kind) + ')</span></div>' +
+        (u.url ? '<a class="ext-link" href="' + esc(u.url) + '" target="_blank" rel="noopener noreferrer" title="Open">↗</a>' : '') +
+      '</div>';
+    }).join("") + '</div>';
+  } else {
+    h += '<div class="small">No active public routes (workers.dev disabled).</div>';
+  }
+  h += '</div>';
+
+  h += '<div class="m-sec"><h3>Authentication &amp; Protection Verification</h3><dl class="m-kv">';
+  h += '<dt>Auth Posture</dt><dd><b>' + esc(EXPO_LABEL[r.expo] || r.expo) + '</b></dd>';
+  if (r.probe) {
+    h += '<dt>Root (GET /)</dt><dd>' + esc(r.probe.rootBehavior || ("HTTP " + r.probe.status)) + (r.probe.ms ? ' <span class="small">(' + r.probe.ms + ' ms)</span>' : '') + '</dd>';
+    if (r.probe.protectedSummary) {
+      h += '<dt>Protected Routes</dt><dd><code>' + esc(r.probe.protectedSummary) + '</code></dd>';
+    }
+    if (r.probe.hint) {
+      h += '<dt>Probe Summary</dt><dd>' + esc(r.probe.hint) + '</dd>';
+    }
+  } else {
+    h += '<dt>Probe</dt><dd><span class="small">Not probed (no active URL)</span></dd>';
+  }
+  if (!state.lite && r.scan) {
+    h += '<dt>Code Auth Marks</dt><dd>' + (r.scan.auth && r.scan.auth.length ? '<code>' + r.scan.auth.map(esc).join('</code> <code>') + '</code>' : '<span class="small">none detected</span>') + '</dd>';
+  }
+  if (!state.lite) {
+    h += '<dt>Secrets Bound</dt><dd>' + (r.secrets && r.secrets.length ? '<code>' + r.secrets.map(esc).join('</code> <code>') + '</code>' : '<span class="small">none</span>') + '</dd>';
+  }
+  h += '</dl></div>';
+
+  if (!state.lite) {
+    h += '<div class="m-sec"><h3>Traffic, Bindings &amp; Metadata</h3><dl class="m-kv">';
+    var reqText = !r.usageLoaded ? "loading…" : (r.req == null ? "0" : r.req.toLocaleString()) + " reqs (" + state.days + "d)";
+    if (r.usage && r.usage.errors) reqText += " · " + r.usage.errors.toLocaleString() + " errors";
+    h += '<dt>Traffic</dt><dd>' + esc(reqText) + '</dd>';
+    h += '<dt>Last Deployed</dt><dd>' + esc(ago(r.modified)) + ' <span class="small">(' + esc((r.modified || "").slice(0, 19).replace("T", " ")) + ')</span></dd>';
+    var groups = {};
+    (r.bindings || []).forEach(function (b) { if (b.type !== "secret_text") (groups[b.type] = groups[b.type] || []).push(b.name); });
+    var bl = Object.keys(groups).map(function (t) { return esc(t) + ": <code>" + groups[t].map(esc).join("</code> <code>") + "</code>"; });
+    h += '<dt>Bindings</dt><dd>' + list(bl) + '</dd>';
+    h += '<dt>LLM / AI</dt><dd>' + (r.llm && r.llm.length ? r.llm.map(esc).join(", ") : '<span class="small">none</span>') + '</dd>';
+    h += '<dt>Assessment</dt><dd>' + list(r.risk.reasons.map(esc)) + '</dd>';
+    if (r.desc && r.desc.text) {
+      h += '<dt>Description</dt><dd>' + esc(r.desc.text) + ' <span class="small">(' + esc(r.desc.src) + ')</span></dd>';
+    }
+    h += '</dl></div>';
+  }
+
+  $("#m-body").innerHTML = h;
+}
+
+function openModal(key) {
+  state.modalKey = key;
+  var r = state.rows.filter(function (x) { return x.key === key; })[0];
+  if (!r) return;
+  renderModal(r);
+  $("#modal-backdrop").hidden = false;
+}
+
+function closeModal() {
+  state.modalKey = "";
+  $("#modal-backdrop").hidden = true;
 }
 
 function tiles() {
   var rs = state.rows, n = rs.length;
-  var exposed = rs.filter(function (r) { return r.expo === "public" || r.expo === "unknown" || r.expo === "weak"; }).length;
+  var rootAuth = rs.filter(function (r) { return r.expo === "password" || r.expo === "token" || r.expo === "access"; }).length;
+  var apiAuth = rs.filter(function (r) { return r.expo === "api_auth"; }).length;
+  var pub = rs.filter(function (r) { return r.expo === "public"; }).length;
+  var off = rs.filter(function (r) { return r.isOff; }).length;
   var high = rs.filter(function (r) { return r.risk.level >= 2; }).length;
-  var llm = rs.filter(function (r) { return r.llm.length; }).length;
-  var down = rs.filter(function (r) { return r.isDown; }).length;
-  var unused = rs.filter(function (r) { return r.unused; }).length;
   function t(v, l) { return '<div class="tile"><b>' + v + "</b><span>" + l + "</span></div>"; }
-  if (state.lite) {
-    var prot = rs.filter(function (r) { return r.expo === "token" || r.expo === "password" || r.expo === "access"; }).length;
-    var open = rs.filter(function (r) { return r.expo === "public" || r.expo === "unknown" || r.expo === "weak"; }).length;
-    var up = rs.filter(function (r) { return r.probe && !r.isDown; }).length;
-    return t(n, "Workers") + t(up, "Up") + t(down, "Down") + t(prot, "Protected") + t(open, "Open");
-  }
-  return t(n, "Workers") + t(exposed, "Exposed") + t(high, "High or critical risk") + t(llm, "Use an LLM") + t(down, "Down") + t(unused, "Unused in " + state.days + " d");
+  return t(n, "Total Workers") +
+    t(rootAuth, "🔒 Root Auth") +
+    t(apiAuth, "🛡️ Landing+Auth") +
+    t(pub, "🌐 Public App") +
+    t(off, "⛔ Disabled/Off") +
+    t(high, "High Risk");
 }
 
 function render() {
   var rows = visible();
   var st = state.fatal ? "Error: " + state.fatal : state.configured && !state.accounts.length ? "No API token yet." : state.pendingAcc > 0 && state.finished >= state.total ? "Loading accounts…" :
-    state.finished < state.total ? "Checking " + state.finished + " / " + state.total + " Workers…" :
-    state.total + " Workers in " + state.accounts.length + " account" + (state.accounts.length === 1 ? "" : "s") + ". Snapshot taken " + new Date().toLocaleTimeString() + ".";
+    state.finished < state.total ? "Probing " + state.finished + " / " + state.total + " Workers…" :
+    state.total + " Workers · Updated " + new Date().toLocaleTimeString();
   $("#status").textContent = st;
   var w = $("#warn");
   if (state.warnings.length || state.fatal) {
     w.hidden = false;
-    w.innerHTML = state.fatal ? esc(state.fatal) : "Some data is missing:" + list(state.warnings.map(esc));
+    w.innerHTML = state.fatal ? esc(state.fatal) : "Notices:" + list(state.warnings.map(esc));
   } else w.hidden = true;
   $("#tiles").innerHTML = tiles();
   var body = rows.map(row).join("");
-  $("#rows").innerHTML = body || '<tr><td colspan="' + colspan() + '" class="empty">' + (state.rows.length ? "No Worker matches the filters." : state.fatal ? "" : state.configured && !state.accounts.length ? (state.manage ? "Add an API token above." : "No API token is set. Set the CF_API_TOKEN secret.") : "Loading…") + "</td></tr>";
+  $("#rows").innerHTML = body || '<tr><td colspan="4" class="empty">' + (state.rows.length ? "No Worker matches the filter." : "Loading…") + "</td></tr>";
   var ths = document.querySelectorAll("th");
   for (var i = 0; i < ths.length; i++) {
     var on = ths[i].getAttribute("data-k") === state.sort.k;
     ths[i].className = (ths[i].className.replace(/\bsorted\b/, "").trim() + (on ? " sorted" : "")).trim();
     ths[i].setAttribute("data-arrow", on ? (state.sort.dir > 0 ? "▲" : "▼") : "");
   }
+  if (state.modalKey) {
+    var cur = state.rows.filter(function (x) { return x.key === state.modalKey; })[0];
+    if (cur) renderModal(cur);
+  }
 }
-
-// ---------- API token panel ----------
 
 function tokMsg(text, err) { var m = $("#tok-msg"); m.textContent = text; m.className = "small" + (err ? " err" : ""); }
 
@@ -1647,14 +1901,13 @@ function loadTokens() {
   return api("/api/tokens").then(function (t) {
     var h = "";
     t.deploy.forEach(function (d) {
-      h += '<div class="trow"><span><b>' + esc(d.via) + '</b> <span class="small">' + esc(d.error ? "error: " + d.error : d.accounts.join(", ") || "no account found") + '</span></span><span class="small">set at deploy</span></div>';
+      h += '<div class="trow"><span><b>' + esc(d.via) + '</b> <span class="small">' + esc(d.error ? "error: " + d.error : d.accounts.join(", ") || "no account") + '</span></span><span class="small">deploy secret</span></div>';
     });
     t.tokens.forEach(function (x) {
       var names = (x.accounts || []).map(function (a) { return a.name; }).join(", ");
-      h += '<div class="trow"><span><b>' + esc(x.label) + '</b> <span class="small">…' + esc(x.last4) + " · " + esc(names) + " · added " + esc(ago(x.added)) + '</span></span><button type="button" data-del="' + esc(x.id) + '">Delete</button></div>';
+      h += '<div class="trow"><span><b>' + esc(x.label) + '</b> <span class="small">…' + esc(x.last4) + " · " + esc(names) + '</span></span><button type="button" data-del="' + esc(x.id) + '">Delete</button></div>';
     });
     if (!h) h = '<p class="small">No token yet.</p>';
-    if (!t.store) h += '<p class="small err">Saving tokens is off. Bind a KV namespace named STORE and deploy again.</p>';
     $("#tok-list").innerHTML = h;
     $("#tok-add").disabled = !t.store;
   }, function (e) { $("#tok-list").textContent = "Cannot load tokens: " + e.message; });
@@ -1670,22 +1923,23 @@ $("#tok-form").addEventListener("submit", function (e) {
   e.preventDefault();
   var btn = $("#tok-add");
   btn.disabled = true;
-  tokMsg("Checking the token…");
+  tokMsg("Checking token…");
   send("POST", "/api/tokens", { label: $("#tok-label").value, token: $("#tok-value").value, accountId: $("#tok-acct").value }).then(function (r) {
     $("#tok-value").value = ""; $("#tok-label").value = ""; $("#tok-acct").value = "";
-    tokMsg("Added. Accounts: " + r.accounts.join(", ") + "." + (r.notes.length ? " " + r.notes.join("; ") + "." : ""));
+    tokMsg("Added.");
     return loadTokens().then(boot);
   }, function (err) { tokMsg(err.message, true); }).then(function () { btn.disabled = false; });
 });
 
-// ---------- events ----------
-
 document.addEventListener("click", function (e) {
+  if (e.target.id === "modal-backdrop" || (e.target.closest && e.target.closest("#m-close"))) {
+    closeModal();
+    return;
+  }
   var del = e.target.closest && e.target.closest("button[data-del]");
   if (del) {
-    if (!window.confirm("Delete this token? Its Workers leave the board.")) return;
+    if (!window.confirm("Delete this token?")) return;
     send("DELETE", "/api/tokens?id=" + encodeURIComponent(del.getAttribute("data-del"))).then(function () {
-      tokMsg("Deleted.");
       return loadTokens().then(boot);
     }, function (err) { tokMsg(err.message, true); });
     return;
@@ -1693,16 +1947,19 @@ document.addEventListener("click", function (e) {
   var th = e.target.closest && e.target.closest("th");
   if (th) {
     var k = th.getAttribute("data-k");
-    state.sort = state.sort.k === k ? { k: k, dir: -state.sort.dir } : { k: k, dir: (k === "name" || k === "url" || k === "expo") ? 1 : -1 };
+    state.sort = state.sort.k === k ? { k: k, dir: -state.sort.dir } : { k: k, dir: (k === "name" || k === "expo") ? 1 : -1 };
     return render();
   }
   var tr = e.target.closest && e.target.closest("tr.row");
   if (tr) {
-    var key = tr.getAttribute("data-key");
-    state.open[key] = !state.open[key];
-    render();
+    openModal(tr.getAttribute("data-key"));
   }
 });
+
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape" && state.modalKey) closeModal();
+});
+
 $("#q").addEventListener("input", function (e) { state.f.q = e.target.value; render(); });
 $("#f-account").addEventListener("change", function (e) { state.f.account = e.target.value; render(); });
 $("#f-expo").addEventListener("change", function (e) { state.f.expo = e.target.value; render(); });
