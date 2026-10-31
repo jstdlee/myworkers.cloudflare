@@ -335,6 +335,13 @@ async function getQuotaSnapshot(env, forceRefresh = false) {
 
 var uptime_worker_default = {
   async fetch(request, env) {
+    if (new URL(request.url).pathname.startsWith("/api/monitors/agent/")) {
+      try {
+        return await monitorAgentApi(request, env, new URL(request.url));
+      } catch (e) {
+        return json({ error: e.message || "error" }, e.status || 500);
+      }
+    }
     const denied = await authorize(request, env);
     if (denied) return denied;
     const lite = !env.DASH_PASSWORD;
@@ -349,6 +356,9 @@ var uptime_worker_default = {
       if (url.pathname === "/api/quota") {
         const force = url.searchParams.get("refresh") === "1";
         return json(await getQuotaSnapshot(env, force));
+      }
+      if (url.pathname === "/api/monitors") {
+        return json(await monitorStatus(env, url.searchParams.get("refresh") === "1"));
       }
       if (request.method !== "GET" && request.method !== "HEAD") {
         return json({ error: "method not allowed" }, 405);
@@ -394,6 +404,152 @@ var uptime_worker_default = {
     }
   }
 };
+// ---------------------------------------------------------------------------
+// Service monitors (external uptime checks).
+// The monitor list lives in KV (key MON_CFG_KEY), not in this public source.
+// Monitors with via "edge" are checked live by this Worker when the board asks.
+// Monitors with via "agent" are checked by a LAN agent, which pulls its list
+// from /api/monitors/agent/config and pushes results to
+// /api/monitors/agent/heartbeat (one KV write per run), authenticated by the
+// X-Monitor-Secret header (secret MONITOR_SECRET). No secret -> 404.
+// ---------------------------------------------------------------------------
+var MON_CFG_KEY = "monitors:config";
+var MON_HB_KEY = "monitors:heartbeat";
+var MON_EDGE_TTL_MS = 60000;
+var __monEdge = null;
+var __monEdgeTs = 0;
+async function monitorAgentApi(request, env, url) {
+  const want = env.MONITOR_SECRET || "";
+  const got = request.headers.get("X-Monitor-Secret") || "";
+  if (!want || !env.STORE) return json({ error: "not found" }, 404);
+  if (!got || !await safeEqual(got, want)) return json({ error: "forbidden" }, 403);
+  const sub = url.pathname.slice("/api/monitors/agent/".length);
+  if (sub === "config" && request.method === "GET") {
+    const cfg = await monitorConfig(env);
+    return json({
+      intervalSec: cfg.agentIntervalSec,
+      monitors: cfg.monitors.filter((m) => m.via === "agent" && !m.retired)
+    });
+  }
+  if (sub === "heartbeat" && request.method === "POST") {
+    const body = await request.json().catch(() => null);
+    if (!body || !Array.isArray(body.results)) throw httpError(400, "results[] required");
+    if (body.results.length > 500) throw httpError(413, "too many results");
+    const results = {};
+    for (const r of body.results) {
+      if (!r || r.id == null) continue;
+      results[String(r.id)] = {
+        ok: !!r.ok,
+        code: Number.isFinite(r.code) ? r.code : null,
+        ms: Number.isFinite(r.ms) ? Math.round(r.ms) : null,
+        error: r.error ? String(r.error).slice(0, 200) : ""
+      };
+    }
+    const hb = { agent: String(body.agent || "agent").slice(0, 40), at: Date.now(), results };
+    await env.STORE.put(MON_HB_KEY, JSON.stringify(hb));
+    return json({ ok: true, stored: Object.keys(results).length });
+  }
+  if (sub === "status" && request.method === "GET") {
+    return json(await monitorStatus(env, url.searchParams.get("refresh") === "1"));
+  }
+  if (sub === "config" && request.method === "PUT") {
+    const body = await request.json().catch(() => null);
+    if (!body || !Array.isArray(body.monitors)) throw httpError(400, "monitors[] required");
+    await env.STORE.put(MON_CFG_KEY, JSON.stringify(body));
+    __monEdge = null;
+    return json({ ok: true, monitors: body.monitors.length });
+  }
+  return json({ error: "not found" }, 404);
+}
+__name(monitorAgentApi, "monitorAgentApi");
+async function monitorConfig(env) {
+  const cfg = env.STORE ? await env.STORE.get(MON_CFG_KEY, "json") : null;
+  return {
+    agentIntervalSec: Number((cfg && cfg.agentIntervalSec) || 600),
+    monitors: Array.isArray(cfg && cfg.monitors) ? cfg.monitors : []
+  };
+}
+__name(monitorConfig, "monitorConfig");
+function statusAccepted(code, accept) {
+  const list = Array.isArray(accept) && accept.length ? accept : ["200-399"];
+  return list.some((a) => {
+    const [lo, hi] = String(a).split("-").map(Number);
+    return code >= lo && code <= (hi || lo);
+  });
+}
+__name(statusAccepted, "statusAccepted");
+async function edgeCheck(m) {
+  const t0 = Date.now();
+  try {
+    const r = await fetch(m.target, {
+      method: m.method || "GET",
+      redirect: "manual",
+      headers: { "User-Agent": UA, Accept: "*/*" },
+      signal: AbortSignal.timeout(Number(m.timeoutMs) || 8000)
+    });
+    const ms = Date.now() - t0;
+    let body = "";
+    if (m.keyword) body = await readCapped(r, 65536);
+    else if (r.body) await r.body.cancel();
+    let ok = statusAccepted(r.status, m.accept);
+    let error = ok ? "" : "HTTP " + r.status;
+    if (ok && m.keyword && !body.includes(m.keyword)) {
+      ok = false;
+      error = "keyword missing";
+    }
+    return { ok, code: r.status, ms, error };
+  } catch (e) {
+    return { ok: false, code: null, ms: Date.now() - t0, error: String(e && e.message || e).slice(0, 200) };
+  }
+}
+__name(edgeCheck, "edgeCheck");
+async function monitorStatus(env, force) {
+  const cfg = await monitorConfig(env);
+  const hb = env.STORE ? await env.STORE.get(MON_HB_KEY, "json") : null;
+  const now = Date.now();
+  const edge = cfg.monitors.filter((m) => m.via === "edge" && !m.retired);
+  if (force || !__monEdge || now - __monEdgeTs > MON_EDGE_TTL_MS) {
+    const out = {};
+    let i = 0;
+    const worker = async () => {
+      while (i < edge.length) {
+        const m = edge[i++];
+        out[String(m.id)] = await edgeCheck(m);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(6, edge.length) }, worker));
+    __monEdge = out;
+    __monEdgeTs = Date.now();
+  }
+  const staleMs = cfg.agentIntervalSec * 3000;
+  const agentAge = hb ? now - hb.at : null;
+  const agentStale = !hb || agentAge > staleMs;
+  const monitors = cfg.monitors.map((m) => {
+    const base = { id: m.id, name: m.name, group: m.group || "Other", type: m.type, target: m.target, via: m.via, note: m.note || "" };
+    if (m.retired) return { ...base, state: "retired" };
+    let r = null, at = null;
+    if (m.via === "edge") {
+      r = __monEdge[String(m.id)];
+      at = __monEdgeTs;
+    } else if (hb && hb.results) {
+      r = hb.results[String(m.id)] || null;
+      at = hb.at;
+    }
+    if (!r) return { ...base, state: "unknown" };
+    const state = m.via === "agent" && agentStale ? "stale" : r.ok ? "up" : "down";
+    return { ...base, state, code: r.code, ms: r.ms, error: r.error, checkedAt: at };
+  });
+  const summary = { up: 0, down: 0, stale: 0, unknown: 0, retired: 0 };
+  for (const m of monitors) summary[m.state] = (summary[m.state] || 0) + 1;
+  return {
+    generatedAt: now,
+    edgeCheckedAt: __monEdgeTs,
+    agent: { name: hb ? hb.agent : null, lastSeen: hb ? hb.at : null, ageSec: agentAge == null ? null : Math.round(agentAge / 1000), stale: agentStale, intervalSec: cfg.agentIntervalSec },
+    summary,
+    monitors
+  };
+}
+__name(monitorStatus, "monitorStatus");
 function httpError(status, message) {
   const e = new Error(message);
   e.status = status;
@@ -1240,6 +1396,19 @@ function page() {
     </div>
     <div id="qgrid" class="qgrid"></div>
   </section>
+  <section id="mon-panel" class="qpanel">
+    <div class="qhead">
+      <div class="qtitle-wrap">
+        <h2>Service Monitors</h2>
+        <span id="mbadge" class="b">Checking\u2026</span>
+      </div>
+      <div class="qmeta">
+        <span id="mtime" class="small"></span>
+        <button id="mrefresh" type="button" class="qbtn">Check Now</button>
+      </div>
+    </div>
+    <div id="mgroups"></div>
+  </section>
   <div class="filters">
     <input id="q" type="search" placeholder="Search worker name…" aria-label="Search">
     <select id="f-account" aria-label="Account" hidden><option value="">All accounts</option></select>
@@ -1325,6 +1494,16 @@ input[type=search]{min-width:140px;flex:1}
 .qmeta{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .qbtn{padding:3px 8px;font-size:11.5px}
 .qgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.mgroup{margin:6px 0 10px}.mgroup h3{font-size:12px;color:var(--mut);margin:0 0 6px;font-weight:600}
+.mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:6px}
+.mitem{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 8px;min-width:0;font-size:12.5px}
+.mitem .mtop{display:flex;justify-content:space-between;gap:6px;align-items:center}
+.mitem .mname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.mitem .msub{color:var(--mut);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mdot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--mut);flex:none}
+.mdot.up{background:var(--ok)}.mdot.down{background:var(--bad)}.mdot.stale,.mdot.unknown{background:var(--warn)}
+.mitem.down{border-color:var(--bad)}
+details.mret summary{cursor:pointer;color:var(--mut);font-size:12px}
 .qitem{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 8px;min-width:0}
 .qtop{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;font-weight:600;margin-bottom:3px;gap:4px}
 .qtop span:first-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1671,7 +1850,60 @@ function loadQuota(force) {
   });
 }
 
+function agoText(ms) {
+  if (ms == null) return "never";
+  var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 90) return s + "s ago";
+  if (s < 5400) return Math.round(s / 60) + "m ago";
+  return Math.round(s / 3600) + "h ago";
+}
+function monItem(m) {
+  var sub = m.state === "retired" ? (m.note || "retired") :
+    (m.state === "up" ? ((m.code ? "HTTP " + m.code + " · " : "") + (m.ms != null ? m.ms + " ms" : "")) :
+    (m.error || m.state));
+  return '<div class="mitem ' + esc(m.state) + '" title="' + esc(m.type + " " + m.target + " · via " + m.via + (m.checkedAt ? " · " + agoText(m.checkedAt) : "")) + '">' +
+    '<div class="mtop"><span class="mname"><span class="mdot ' + esc(m.state) + '"></span>' + esc(m.name) + '</span>' +
+    '<span class="small">' + esc(m.state === "up" ? "UP" : m.state.toUpperCase()) + '</span></div>' +
+    '<div class="msub">' + esc(sub) + '</div>' +
+    '<div class="msub">' + esc(m.type + " " + m.target) + '</div></div>';
+}
+function loadMonitors(force) {
+  var mb = $("#mbadge"), mt = $("#mtime"), mg = $("#mgroups"), btn = $("#mrefresh");
+  if (!mb || !mg) return Promise.resolve();
+  if (force) { mb.textContent = "Checking…"; mb.className = "b"; if (btn) btn.disabled = true; }
+  return api("/api/monitors" + (force ? "?refresh=1" : "")).then(function (d) {
+    if (btn) btn.disabled = false;
+    var s = d.summary || {};
+    var bad = (s.down || 0) + (s.stale || 0) + (s.unknown || 0);
+    mb.textContent = (s.up || 0) + " up · " + (s.down || 0) + " down" + ((s.stale || 0) + (s.unknown || 0) ? " · " + ((s.stale || 0) + (s.unknown || 0)) + " no data" : "");
+    mb.className = "b " + (s.down ? "bad" : bad ? "warn" : "ok");
+    var ag = d.agent || {};
+    mt.textContent = "Edge " + agoText(d.edgeCheckedAt) + " · LAN agent " + (ag.name ? ag.name + " " : "") + agoText(ag.lastSeen) + (ag.stale ? " (STALE)" : "");
+    var groups = {}, order = [], retired = [];
+    (d.monitors || []).forEach(function (m) {
+      if (m.state === "retired") { retired.push(m); return; }
+      if (!groups[m.group]) { groups[m.group] = []; order.push(m.group); }
+      groups[m.group].push(m);
+    });
+    var rank = { down: 0, stale: 1, unknown: 1, up: 2 };
+    var html = order.map(function (g) {
+      var list = groups[g].sort(function (a, b) { return (rank[a.state] - rank[b.state]) || String(a.name).localeCompare(String(b.name)); });
+      var dn = list.filter(function (m) { return m.state !== "up"; }).length;
+      return '<div class="mgroup"><h3>' + esc(g) + ' · ' + (list.length - dn) + '/' + list.length + ' up</h3><div class="mgrid">' + list.map(monItem).join("") + '</div></div>';
+    }).join("");
+    if (retired.length) html += '<details class="mret"><summary>Retired (' + retired.length + ', not checked)</summary><div class="mgrid">' + retired.map(monItem).join("") + '</div></details>';
+    if (!(d.monitors || []).length) html = '<p class="small">No monitors configured (KV key monitors:config).</p>';
+    mg.innerHTML = html;
+  }).catch(function (e) {
+    if (btn) btn.disabled = false;
+    mb.textContent = "Monitor Error";
+    mb.className = "b warn";
+    mt.textContent = e.message;
+  });
+}
+
 function boot() {
+  loadMonitors(false);
   state.rows = []; state.warnings = []; state.total = 0; state.finished = 0; state.fatal = ""; state.pendingAcc = 1;
   render();
   loadQuota(false);
@@ -1969,6 +2201,8 @@ $("#f-down").addEventListener("change", function (e) { state.f.down = e.target.c
 $("#f-unused").addEventListener("change", function (e) { state.f.unused = e.target.checked; render(); });
 $("#reload").addEventListener("click", function () { boot(); });
 $("#qrefresh").addEventListener("click", function () { loadQuota(true); });
+$("#mrefresh").addEventListener("click", function () { loadMonitors(true); });
+setInterval(function () { if (!document.hidden) loadMonitors(false); }, 60000);
 $("#days").addEventListener("change", function (e) {
   state.days = Number(e.target.value);
   state.rows.forEach(function (r) { r.usageLoaded = false; r.usage = null; compute(r); });
