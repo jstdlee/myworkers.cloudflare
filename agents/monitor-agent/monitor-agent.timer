@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Worker Board LAN monitor agent every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*:0/10
+Persistent=true
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target

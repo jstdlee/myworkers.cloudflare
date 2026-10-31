@@ -1,0 +1,11 @@
+{
+ "version": 1,
+ "agentIntervalSec": 600,
+ "monitors": [
+  {"id": 1, "name": "public-site", "group": "Cloudflare Workers", "type": "http", "target": "https://app.example.com", "via": "edge", "method": "GET", "accept": ["200-399"]},
+  {"id": 2, "name": "nas-web", "group": "LAN", "type": "http", "target": "http://192.0.2.10:8080/", "via": "agent", "method": "GET", "accept": ["200-399"]},
+  {"id": 3, "name": "nas-ssh", "group": "LAN", "type": "tcp", "target": "192.0.2.10:22", "via": "agent"},
+  {"id": 4, "name": "router-ping", "group": "LAN", "type": "ping", "target": "192.0.2.1", "via": "agent"},
+  {"id": 5, "name": "old-service", "group": "LAN", "type": "http", "target": "http://192.0.2.11/", "via": "agent", "retired": true, "note": "kept for history, not checked"}
+ ]
+}

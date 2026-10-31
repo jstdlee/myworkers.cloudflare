@@ -1,0 +1,8 @@
+[Unit]
+Description=Worker Board LAN monitor agent (push heartbeat)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/bin/monitor-agent.py
+TimeoutStartSec=120

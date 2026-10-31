@@ -1,0 +1,11 @@
+# Local secrets and private config: never commit
+.env
+.env.*
+!.env.example
+*.local.json
+monitors.config.json
+.dev.vars
+.wrangler/
+node_modules/
+__pycache__/
+*.pyc

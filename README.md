@@ -34,7 +34,16 @@ Single-page, HTTP Basic Auth-protected, mobile-first dashboard combining:
 - `DASH_PASSWORD` (`secret_text`): HTTP Basic Auth password for browser login
 - `GUARD_SECRET` (`secret_text`): Shared secret for internal hourly Service Binding trigger (`X-Guard-Secret`) and fallback Basic Auth login
 - `TOKEN_KEY` (`secret_text`, optional): Encryption key for multi-account saved tokens in `STORE`
-- `STORE` (`kv_namespace`, optional): Used only if saving extra multi-account tokens via `/api/tokens` (Quota Guard itself is 100% stateless in memory)
+- `STORE` (`kv_namespace`, optional): Saved multi-account tokens via `/api/tokens`, plus the Service Monitors list and last agent heartbeat (Quota Guard itself is 100% stateless in memory)
+- `MONITOR_SECRET` (`secret_text`, optional): Shared secret for the LAN monitor agent (`X-Monitor-Secret`). Without it, `/api/monitors/agent/*` returns 404.
+
+### Service Monitors (external uptime checks)
+The board shows a **Service Monitors** panel next to the Workers inventory, so one board covers Workers, public sites and LAN services.
+- The monitor list is **not in this repository**. It lives in KV `STORE` under `monitors:config` (see `agents/monitor-agent/monitors.config.example.json`). Real hostnames and private IPs stay in KV / local `.env`, never in git.
+- `via: "edge"` monitors (public HTTP(S)) are checked live by the Worker when the board loads (cached 60 s).
+- `via: "agent"` monitors (LAN HTTP, TCP ports, ping) are checked by `agents/monitor-agent/monitor-agent.py` on a LAN host (systemd user timer, every 10 min). It pulls its list from `GET /api/monitors/agent/config` and pushes results to `POST /api/monitors/agent/heartbeat` (one KV write per run). Results older than 3 intervals show as `stale`.
+- `retired: true` monitors are listed but not checked.
+- Upload or replace the list: `curl -X PUT -H "X-Monitor-Secret: $MONITOR_SECRET" -H 'Content-Type: application/json' --data @monitors.config.json https://<board>/api/monitors/agent/config` (`monitors.config.json` is gitignored).
 
 ---
 
